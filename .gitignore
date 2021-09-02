@@ -18,4 +18,5 @@
 *_sessionInfo_*.txt
 .Rhistory
 heures_555.csv
+data-raw/*.csv
 sessions/
