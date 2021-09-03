@@ -43,8 +43,8 @@ catch_metadata <- lapply(tokens, function(token) {
 
 # Import data from CSV files
 csv_files = list(
-  personal_data = "CATCHPersonalData_DATA_2021-09-02_1548.csv",
-  research_data = "CATCHResearchData_DATA_2021-09-02_1547.csv"
+  personal_data = "CATCHPersonalData_DATA_2021-09-03_1045.csv",
+  research_data = "CATCHResearchData_DATA_2021-09-03_1046.csv"
 )
 catch_data_csv <- lapply(csv_files, function(csv) {
   read.csv(file.path("data-raw", csv))
@@ -119,4 +119,4 @@ cmp <- mclapply(U, function(u) {
 # Export
 tbls <- list(personal_data = cmp$personal_data$variables,
              research_data = cmp$research_data$variables)
-write_xlsx(tbls, "results/comparison_api_csv_20210902.xlsx")
+write_xlsx(tbls, "results/comparison_api_csv_20210903.xlsx")
