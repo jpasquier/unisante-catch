@@ -1,8 +1,9 @@
+library(RCurl)
+library(XML)
+library(catchr)
 library(geeM)
 library(parallel)
-library(RCurl)
 library(writexl)
-library(XML)
 
 options(mc.cores = detectCores() - 1)
 
@@ -98,13 +99,10 @@ relatives$condition <-
 
 # Index cases relatives who came
 b <- pdta$cat_e_participant_type %in% 2 & pdta$cat_con_agree %in% 1
-v <- c(idv, "cat_s_referent_id")
+v <- c(idv, "cat_s_referent_id", "cat_l_result")
 participants <- pdta[b, v]
 if (any(duplicated(participants$cat_ec_participant_sid))) stop("duplicated id")
-###############################################################################
-#if (any(participants$cat_s_referent_id == "")) stop("missing referent")
-if (any(participants$cat_s_referent_id == "")) warning("missing referent")
-###############################################################################
+if (any(participants$cat_s_referent_id == "")) stop("missing referent")
 participants <- merge(
   participants,
   pdta[pdta$cat_e_participant_type %in% 1:2,
@@ -133,16 +131,24 @@ b <- aggregate(cat_s_referent_id ~ cat_s_familycode, participants,
 if (any(!b)) stop("multiple referent per family")
 rm(b)
 
-# Number of relatives and participants per family
-r <- aggregate(condition ~ cat_s_familycode, relatives, sum)
-names(r)[2] <- "n_relatives"
+# Number of relatives, participants, results and positives per family
+r <- list(aggregate(condition ~ cat_s_familycode, relatives, sum))
+names(r[[1]])[2] <- "n_relatives"
 p <- aggregate(cat_ec_participant_sid ~ cat_s_familycode, participants, length)
 names(p)[2] <- "n_participants"
+p_r <- aggregate(!is.na(cat_l_result) ~ cat_s_familycode, participants, sum)
+names(p_r)[2] <- "n_results"
+p_p <- aggregate(I(cat_l_result %in% 1) ~ cat_s_familycode, participants, sum)
+names(p_p)[2] <- "n_positive"
 n <- merge(r, p, by = "cat_s_familycode", all = TRUE)
+n <- merge(n, p_r, by = "cat_s_familycode", all = TRUE)
+n <- merge(n, p_p, by = "cat_s_familycode", all = TRUE)
 if (any(is.na(n$n_relatives))) stop("check n_relatives")
 n[is.na(n)] <- 0
 if (any(n$n_relatives < n$n_participants)) stop("n_relatives < n_participants")
-rm(r, p)
+if (any(n$n_participants < n$n_results)) stop("n_participants < n_results")
+if (any(n$n_results < n$n_positive)) stop("n_results < n_positive")
+rm(r, p, p_r, p_p)
 
 # Add study variables to table `n`
 s <- unique(pdta[pdta$cat_e_participant_type %in% 1,
@@ -155,72 +161,138 @@ n$cat_s_date_rdv_two <- as.Date(n$cat_s_date_rdv_two,
                                 format = "%Y-%m-%d %H:%M")
 rm(s)
 
-# Generate data to analyse from n
-adta <- do.call(rbind, lapply(1:nrow(n), function(i) {
+# Analyse - Generate data from n
+adta <- list()
+adta$participation_rate <- do.call(rbind, lapply(1:nrow(n), function(i) {
   if (n[i, "n_relatives"] == 0) return(NULL)
   with(n[i, ], data.frame(
     participate = c(rep(0, n_relatives - n_participants),
                     rep(1, n_participants)),
     familycode = cat_s_familycode,
     arm = factor(cat_s_arm, 2:1, c("Control", "Intervention")),
-    result = factor(cat_l_result, 2:1, c("Negative", "Positive")),
+    index_case_result = factor(cat_l_result, 2:1, c("Negative", "Positive")),
+    date_rdv2 = cat_s_date_rdv_two
+  ))
+}))
+adta$positivity_rate <- do.call(rbind, lapply(1:nrow(n), function(i) {
+  if (n[i, "n_results"] == 0) return(NULL)
+  with(n[i, ], data.frame(
+    positive = c(rep(0, n_results - n_positive),
+                 rep(1, n_positive)),
+    familycode = cat_s_familycode,
+    arm = factor(cat_s_arm, 2:1, c("Control", "Intervention")),
+    index_case_result = factor(cat_l_result, 2:1, c("Negative", "Positive")),
     date_rdv2 = cat_s_date_rdv_two
   ))
 }))
 
-# Analyses
+# Analyse participation and positivity rate
 S <- c("all", "negative", "positive")
 S <- c(S, paste0(S, "_6m"))
 S <- setNames(S, S)
-fits <- mclapply(S, function(s) {
-  sdta <- subset(adta, !is.na(arm))
-  if (grepl("^negative", s)) {
-    sdta <- subset(sdta, !is.na(result) & result == "Negative")
-  } else if (grepl("^positive", s)) {
-    sdta <- subset(sdta, !is.na(result) & result == "Positive")
-  }
-  if (grepl("_6m$", s)) {
-    six_months_ago <- seq(Sys.Date(), length = 2, by = "-6 months")[2]
-    sdta <- subset(sdta, !is.na(date_rdv2) & date_rdv2 <= six_months_ago)
-  }
-  fit <- geem(participate ~ arm, id = familycode, corstr = "exch",
-              family = binomial, data = sdta)
-  smy <- summary(fit)
-  # odds ratio of the GEE model
-  or <- smy$beta
-  s <- qnorm(0.975) * smy$se.robust
-  or <- exp(cbind(or = or, or_lwr = or - s, or_upr = or + s))
-  or <- cbind(data.frame(coef = smy$coefnames), or, data.frame(pval = smy$p))
-  # predictions of the gee model
-  x <- list(c(1, 0), c(1, 1))
-  s <- qnorm(0.975) * sqrt(sapply(x, function(z) (z %*% fit$var %*% z)[1, 1]))
-  p <- sapply(x, function(z) z %*% fit$beta)
-  p <- 1 / (1 + exp(-cbind(prop = p, prop_lwr = p - s, prop_upr = p + s)))
-  p <- cbind(data.frame(coef = smy$coefnames), p)
-  # Table
-  tbl <- cbind(p, rbind(NA, or[-1, -1]))
-  tbl$coef[tbl$coef == "(Intercept)"] <- levels(sdta$arm)[1]
-  tbl$coef <- sub("^arm", "", tbl$coef)
-  names(tbl)[names(tbl) == "coef"] <- "arm"
+tbls <- mclapply(S, function(s) {
+  sdta <- lapply(adta, function(z) {
+    sdta <- subset(z, !is.na(arm))
+    if (grepl("^negative", s)) {
+      sdta <- subset(sdta, index_case_result %in% "Negative")
+    } else if (grepl("^positive", s)) {
+      sdta <- subset(sdta, index_case_result %in% "Positive")
+    }
+    if (grepl("_6m$", s)) {
+      six_months_ago <- seq(Sys.Date(), length = 2, by = "-6 months")[2]
+      sdta <- subset(sdta, !is.na(date_rdv2) & date_rdv2 <= six_months_ago)
+    }
+    return(sdta)
+  })
+  fits <- lapply(setNames(names(sdta), names(sdta)), function(u) {
+    fml <- if (u == "participation_rate") participate ~ 1 else positive ~ 1
+    fmls <- list(fml, update(fml, . ~ arm))
+    lapply(fmls, function(fml) {
+      if (u == "positivity_rate" & !grepl("^positive", s)) return(NULL)
+      catch_expr(
+        geem(fml, id = familycode, corstr = "exch",
+             family = binomial, data = sdta[[u]]),
+        warning = c(collect, muffle)
+      )
+    })
+  })
+  wrns <- unlist(lapply(fits, lapply, function(fit) {
+    if (is.null(fit)) character(0) else do.call(paste, fit$warning)
+  }), recursive = FALSE)
+  fits <- lapply(fits, lapply, function(fit) {
+    if (is.null(fit)) return(NULL)
+    fit$value
+  })
+  tbls <- lapply(fits, lapply, function(fit) {
+    if (is.null(fit)) return(NULL)
+    smy <- summary(fit)
+    # odds ratio of the GEE model
+    or <- smy$beta
+    s <- qnorm(0.975) * smy$se.robust
+    or <- exp(cbind(or = or, or_lwr = or - s, or_upr = or + s))
+    or <- cbind(data.frame(coef = smy$coefnames), or, data.frame(pval = smy$p))
+    # predictions of the gee model
+    x <- if (length(fit$beta) == 1) list(1) else list(c(1, 0), c(1, 1))
+    s <- qnorm(0.975) * 
+      sqrt(sapply(x, function(z) (z %*% fit$var %*% z)[1, 1]))
+    p <- sapply(x, function(z) z %*% fit$beta)
+    p <- 1 / (1 + exp(-cbind(prop = p, prop_lwr = p - s, prop_upr = p + s)))
+    p <- cbind(data.frame(coef = smy$coefnames), p)
+    # Table
+    w <- data.frame(or = NA, or_lwr = NA, or_upr = NA, pval = NA)
+    tbl <- cbind(p, rbind(w, or[-1, -1]))
+    if (nrow(tbl) == 1) {
+      tbl$coef <- ""
+    } else {
+      tbl$coef <- sub("\\(Intercept\\)", "Control", tbl$coef)
+      tbl$coef <- sub("^arm", "", tbl$coef)
+    }
+    names(tbl)[names(tbl) == "coef"] <- "arm"
+    tbl
+  })
+  tbls <- lapply(tbls, function(z) do.call(rbind, z))
+  tbls <- tbls[!sapply(tbls, is.null)]
   # Number of families, relatives and participants per arm
-  n_fam <- aggregate(familycode ~ arm, sdta, function(z) length(unique(z)))
-  names(n_fam)[2] <- "n_families"
   Merge <- function(x, y) merge(x, y, by = "arm")
-  fcts <- c(n_relatives = "length", n_participants = "sum", raw_prop = "mean")
-  n <- Reduce(Merge, lapply(names(fcts), function(u) {
-    z <- aggregate(participate ~ arm, sdta, get(fcts[u]))
-    names(z)[2] <- u
-    return(z)
-  }))
-  n <- Merge(n_fam, n)
-  tbl <- Merge(n, tbl)
-  # Results
-  list(fit = fit, tbl = tbl)
+  n <- lapply(setNames(names(sdta), names(sdta)), function(u) {
+    if (u == "positivity_rate" & !grepl("^positive", s)) return(NULL)
+    d <- sdta[[u]]
+    n_fam <- aggregate(familycode ~ arm, d, function(z) length(unique(z)))
+    names(n_fam)[2] <- "n_families"
+    n0 <- data.frame(arm = "", n_families = length(unique(d$familycode)))
+    n_fam <- rbind(n0, n_fam)
+    if (u == "participation_rate") {
+      fcts <- c(n_relatives = "length", n_participants = "sum",
+                raw_prop = "mean")
+      y <- "participate"
+    } else {
+      fcts <- c(n_results = "length", n_positive = "sum", raw_prop = "mean")
+      y <- "positive"
+    }
+    fml <- as.formula(paste(y, "~ arm"))
+    n <- Reduce(Merge, lapply(names(fcts), function(w) {
+      z <- aggregate(fml, d, get(fcts[w]))
+      names(z)[2] <- w
+      z0 <- setNames(data.frame("", get(fcts[w])(d[[y]])), c("arm", w))
+      return(rbind(z0, z))
+    }))
+    Merge(n_fam, n)
+  })
+  n <- n[!sapply(n, is.null)]
+  tbl <- lapply(setNames(names(tbls), names(tbls)), function(u) {
+    Merge(n[[u]], tbls[[u]])
+  })
+  attr(tbl, "warnings") <- wrns
+  return(tbl)
 })
 rm(S)
 
+# Warnings
+wrns <- unlist(lapply(tbls, function(tbl) attr(tbl, "warnings")))
+
 # Export table
-tbls <- append(lapply(fits, function(z) z$tbl), list(N = n))
+z <- append(unlist(tbl, recursive = FALSE), list(N = n))
+z <- z[!sapply(z, is.null)]
 f <- paste0("results/IC_analysis_", format(Sys.Date(), "%Y%m%d"), ".xlsx")
-write_xlsx(tbls, f)
-rm(f)
+write_xlsx(z, f)
+rm(z, f)
