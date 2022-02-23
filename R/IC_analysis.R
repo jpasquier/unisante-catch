@@ -20,12 +20,19 @@ token <- "misc/redcap_personal_data.token"
 token <- readChar(token, file.info(token)$size - 1)
 
 # Import personal data with the API (RCurl)
-pdta <- read.csv(text = postForm(
-  uri = uri,
-  token = token,
-  content = 'record',
-  format = 'csv'
-))
+tmp_file <- "/mnt/ramdisk/CATCH_pdta.rda"
+if (file.exists(tmp_file)) {
+  load(tmp_file)
+} else {
+  pdta <- read.csv(text = postForm(
+    uri = uri,
+    token = token,
+    content = 'record',
+    format = 'csv'
+  ))
+  save(pdta, file = tmp_file)
+}
+rm(tmp_file)
 
 # Help funtion to check if values are missing
 any.miss <- function(x) any(is.na(x) | x == "")
@@ -76,9 +83,21 @@ rm(i, ids, v)
 # rm(v)
 
 # Relatives who meet the conditions to be invited
+# relatives$condition <-
+#   apply(relatives[paste0("cat_r_", c("alive", "country", "participate"))],
+#         1, function(z) all(!is.na(z) & (z == c(1, 1, 0) | z == c(3, 3, 0))))
 relatives$condition <-
-  apply(relatives[paste0("cat_r_", c("alive", "country", "participate"))],
-        1, function(z) all(!is.na(z) & (z == c(1, 1, 0) | z == c(3, 3, 0))))
+  apply(relatives[paste0("cat_r_", c("alive", "country"))],
+        1, function(z) all(!is.na(z) & z %in% c(1, 3)))
+
+# At most one parent could be invited
+z <- aggregate(cat_r_type ~ cat_ec_participant_sid,
+               subset(relatives, condition),
+               function(z) all(1:2 %in% z))
+z <- z[z[[2]], 1]
+z <- relatives$cat_ec_participant_sid %in% z & relatives$cat_r_type %in% 2
+relatives <- relatives[!z, ]
+rm(z)
 
 # # cat_r_id that are in the variable cat_ec_participant_sid
 # relatives$rid_in_sid <-
@@ -100,9 +119,16 @@ relatives$condition <-
 # Index cases relatives who came
 b <- pdta$cat_e_participant_type %in% 2 & pdta$cat_con_agree %in% 1
 v <- c(idv, "cat_s_referent_id", "cat_l_result")
+v <- c(idv, "cat_s_referent_id", "cat_s_referent_relation", "cat_l_result")
 participants <- pdta[b, v]
 if (any(duplicated(participants$cat_ec_participant_sid))) stop("duplicated id")
-if (any(participants$cat_s_referent_id == "")) stop("missing referent")
+#if (any(participants$cat_s_referent_id == "")) stop("missing referent")
+if (any(participants$cat_s_referent_id == "")) {
+  warning("missing referent(s) - remove participant(s) - possible bias")
+  write_xlsx(participants[participants$cat_s_referent_id == "", ],
+             "~/missing_referent.xlsx")
+  participants <- participants[participants$cat_s_referent_id != "", ]
+}
 participants <- merge(
   participants,
   pdta[pdta$cat_e_participant_type %in% 1:2,
@@ -117,6 +143,13 @@ participants <- participants[participants$referent_type == 1, ]
 participants <- participants[order(participants$cat_s_familycode), ]
 nrow(participants)
 rm(b, v)
+
+# Check that at most one of the parents participates. This is equivalent to
+# checking that the referent is at most once the son or daughter of a
+# participant.
+b <- with(participants, table(cat_s_referent_id, cat_s_referent_relation))
+b <- subset(as.data.frame(b), cat_s_referent_relation %in% 5:6)$Freq <= 1
+if (any(!b)) stop("more than one parent participate")
 
 # Check that relatives are all linked to one person (index case) per family
 b <- aggregate(cat_ec_participant_sid ~ cat_s_familycode, relatives,
@@ -186,7 +219,7 @@ adta$positivity_rate <- do.call(rbind, lapply(1:nrow(n), function(i) {
   ))
 }))
 
-# Analyse participation and positivity rate
+# Participation and positivity rates (proportions)
 S <- c("all", "negative", "positive")
 S <- c(S, paste0(S, "_6m"))
 S <- setNames(S, S)
@@ -287,11 +320,64 @@ tbls <- mclapply(S, function(s) {
 })
 rm(S)
 
+# Detection rate
+tbls2 <- lapply(c(positive = 1, positive_6m = 3), function(k) {
+  sdta <- subset(n, cat_l_result %in% 1)
+  if (k == 2) {
+    six_months_ago <- seq(Sys.Date(), length = 2, by = "-6 months")[2]
+    sdta <- subset(sdta, !is.na(cat_s_date_rdv_two) &
+                           cat_s_date_rdv_two <= six_months_ago)
+  }
+  sdta <- na.omit(sdta[c("n_positive", "cat_s_arm")])
+  sdta$arm <- factor(sdta$cat_s_arm, 2:1, c("Control", "Intervention"))
+  fmls <- list(n_positive ~ 1, n_positive ~ arm)
+  tbl <- do.call(rbind, lapply(fmls, function(fml) {
+    fit <- glm(fml, family = poisson, data = sdta)
+    # rate ratios of the Poisson model
+    beta <- coef(fit)
+    s <- qnorm(0.975) * sqrt(diag(vcov(fit)))
+    rr <- exp(cbind(rr = beta, rr_lwr = beta - s, rr_upr = beta + s))
+    rr <- cbind(data.frame(coef = names(beta)), rr,
+                pval = coef(summary(fit))[, 4])
+    # predictions of the Poisson model
+    x <- if (length(beta) == 1) list(1) else list(c(1, 0), c(1, 1))
+    s <- qnorm(0.975) *
+      sqrt(sapply(x, function(z) (z %*% vcov(fit) %*% z)[1, 1]))
+    r <- sapply(x, function(z) z %*% beta)
+    r <- exp(cbind(rate = r, rate_lwr = r - s, rate_upr = r + s))
+    r <- cbind(data.frame(coef = names(beta)), r)
+    # Table
+    w <- data.frame(rr = NA, rr_lwr = NA, rr_upr = NA, pval = NA)
+    tbl <- cbind(r, rbind(w, rr[-1, -1]))
+    if (nrow(tbl) == 1) {
+      tbl$coef <- ""
+    } else {
+      tbl$coef <- sub("\\(Intercept\\)", "Control", tbl$coef)
+      tbl$coef <- sub("^arm", "", tbl$coef)
+    }
+    names(tbl)[names(tbl) == "coef"] <- "arm"
+    names(tbl) <- sub("^rr", "rate_ratio", names(tbl))
+    rownames(tbl) <- NULL
+    tbl
+  }))
+  n1 <- data.frame(
+    arm = c("", "Control", "Intervention"),
+    n_families = c(nrow(sdta), sum(sdta$arm == "Control"),
+                   sum(sdta$arm == "Intervention")),
+    n_positive = c(sum(sdta$n_positive),
+                   sum(sdta[sdta$arm == "Control", "n_positive"]),
+                   sum(sdta[sdta$arm == "Intervention", "n_positive"]))
+  )
+  merge(n1, tbl, by = "arm", sort = FALSE)
+})
+for (s in names(tbls2)) tbls[[s]]$detection_rate <- tbls2[[s]]
+rm(s, tbls2)
+
 # Warnings
 wrns <- unlist(lapply(tbls, function(tbl) attr(tbl, "warnings")))
 
 # Export table
-z <- append(unlist(tbl, recursive = FALSE), list(N = n))
+z <- append(unlist(tbls, recursive = FALSE), list(N = n))
 z <- z[!sapply(z, is.null)]
 f <- paste0("results/IC_analysis_", format(Sys.Date(), "%Y%m%d"), ".xlsx")
 write_xlsx(z, f)
