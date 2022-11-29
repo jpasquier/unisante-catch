@@ -13,8 +13,6 @@ library(DT)
 library(writexl)
 
 options(mc.cores = detectCores() - 1)
-RNGkind("L'Ecuyer-CMRG")
-set.seed(666)
 
 # Declare location of current script
 i_am('R/app_shiny.R')
@@ -37,6 +35,35 @@ pdata <- read.csv(text = postForm(
 ))
 rm(uri, token)
 
+# ------------------------------ Participants ------------------------------- #
+
+# Select variables from personal data
+obs <- pdata %>%
+  filter(cat_e_participant_type %in% 1:2) %>%
+  select(id = cat_ec_participant_sid, indexCase = cat_e_participant_type,
+         fid = cat_s_familycode, armExp = cat_s_arm, positive = cat_l_result,
+         sexM = cat_dp_sexe_v2, firstName = cat_dp_prenom_v2) %>%
+  mutate(across(c(indexCase, armExp, positive, sexM), function(x) 2L - x),
+         participate = 1L)
+
+# Sent SMS (by family)
+sms <- pdata %>%
+  select(id = cat_ec_participant_sid, sms = cat_r_sms_done) %>%
+  left_join(
+    pdata %>%
+      select(id = cat_ec_participant_sid, fid = cat_s_familycode) %>%
+      filter(!is.na(id) & id != '' & !is.na(fid) & fid != ''),
+   by = 'id'
+  ) %>%
+  group_by(fid) %>%
+  summarise(n_sms = sum(sms, na.rm = TRUE))
+
+# Define SMS arm
+obs <- obs %>%
+  left_join(sms, by = 'fid') %>%
+  mutate(armSMS = as.integer(n_sms > 0)) %>%
+  select(!n_sms)
+
 # ------------------------------- Graph data -------------------------------- #
 
 files <- sapply(list.dirs(here('data-raw', 'matrices_20221110'),
@@ -45,32 +72,23 @@ files <- sapply(list.dirs(here('data-raw', 'matrices_20221110'),
 gdata <- mclapply(files, function(f) {
   # Family ID
   fid <- sub('\\.csv$', '', basename(f))
-  # Contingency matrices
-  cmat <- as.matrix(read.csv(f, row.names = 1, check.names = FALSE))
-  cmat[is.na(cmat)] <- ''
-  cmat <- trimws(cmat)
-  rownames(cmat) <- substr(rownames(cmat), 1, 10)
-  colnames(cmat) <- substr(colnames(cmat), 1, 10)
+  # Adjacency matrices
+  adj_mat <- as.matrix(read.csv(f, row.names = 1, check.names = FALSE))
+  adj_mat[is.na(adj_mat)] <- ''
+  adj_mat <- trimws(adj_mat)
+  rownames(adj_mat) <- substr(rownames(adj_mat), 1, 10)
+  colnames(adj_mat) <- substr(colnames(adj_mat), 1, 10)
   # Nodes
-  nodes <- pdata %>%
-    filter(cat_e_participant_type %in% 1:2) %>%
-    select(id = cat_ec_participant_sid, indexCase = cat_e_participant_type,
-           armExp = cat_s_arm, positive = cat_l_result,
-           firstName = cat_dp_prenom_v2, sexM = cat_dp_sexe_v2) %>%
-    mutate(participate = 1L) %>%
-    right_join(data.frame(id = unique(rownames(cmat))), by = 'id') %>%
-    mutate(
-      indexCase = if_else(is.na(indexCase), 0L, 2L - indexCase),
-      armExp = 2L - armExp,
-      positive = 2L - positive,
-      sexM = 2L - sexM,
-      participate = if_else(is.na(participate), 0L, participate)
-    )
-  nodes[is.na(nodes$armExp), 'armExp'] <- 
+  nodes <- obs %>%
+    right_join(data.frame(id = unique(rownames(adj_mat))), by = 'id') %>%
+    mutate(across(c(indexCase, participate), replace_na, 0L))
+  nodes[is.na(nodes$armExp), 'armExp'] <-
     if (all(is.na(nodes$armExp))) NA else na.omit(nodes$armExp)[1]
+  # Check fid
+  fid_ok <- all(na.omit(nodes$fid) %in% fid)
   # Edges
-  edges <- map_dfr(rownames(cmat), function(x) {
-    z <- cmat[x, ][cmat[x, ] != '']
+  edges <- map_dfr(rownames(adj_mat), function(x) {
+    z <- adj_mat[x, ][adj_mat[x, ] != '']
     if (length(z) == 0) {
       data.frame(from = character(0), to = character(0), label = character(0))
     } else {
@@ -170,7 +188,8 @@ gdata <- mclapply(files, function(f) {
                         TRUE ~ 'black')
     )
   # return results
-  list(nodes = nodes, edges = edges, cmat = cmat, fid = fid)
+  list(nodes = nodes, edges = edges, adj_mat = adj_mat, fid = fid,
+       fid_ok = fid_ok)
 })
 names(gdata) <- sapply(gdata, function(z) z$fid)
 rm(files)
@@ -181,7 +200,7 @@ rm(files)
 ndata <- map_dfr(gdata, ~ mutate(.x$nodes, fid = .x$fid)) %>%
   group_by(fid) %>%
   mutate(
-    positiveIndexCase = 
+    positiveIndexCase =
       if (sum(indexCase) == 1) positive[indexCase == 1] else NA_integer_,
     armExp = if (length(unique(na.omit(armExp))) == 1) na.omit(armExp)[1] else
       NA_integer_
@@ -236,7 +255,7 @@ tbls <- mclapply(tbls, function(j) {
                 data.frame(pval = smy$p))
     # predictions of the gee model
     x <- if (length(fit$beta) == 1) list(1) else list(c(1, 0), c(1, 1))
-    s <- qnorm(0.975) * 
+    s <- qnorm(0.975) *
       sqrt(sapply(x, function(z) (z %*% fit$var %*% z)[1, 1]))
     p <- sapply(x, function(z) z %*% fit$beta)
     p <- 1 / (1 + exp(-cbind(prop = p, prop_lwr = p - s, prop_upr = p + s)))
@@ -333,7 +352,7 @@ ftbls <- lapply(tbls, function(tbl) {
       mutate(
         prop = paste0(sprintf("%.2f", prop), ' (', sprintf("%.2f", prop_lwr),
                       ',', sprintf("%.2f", prop_upr), ')'),
-        or = if_else(!is.na(or), 
+        or = if_else(!is.na(or),
           paste0(sprintf("%.2f", or), ' (', sprintf("%.2f", or_lwr), ',',
                  sprintf("%.2f", or_upr), ')'),
           as.character(NA))
@@ -346,7 +365,7 @@ ftbls <- lapply(tbls, function(tbl) {
       mutate(
         rate = paste0(sprintf("%.2f", rate), ' (', sprintf("%.2f", rate_lwr),
                       ',', sprintf("%.2f", rate_upr), ')'),
-        rate_ratio = if_else(!is.na(rate_ratio), 
+        rate_ratio = if_else(!is.na(rate_ratio),
           paste0(sprintf("%.2f", rate_ratio), ' (',
                  sprintf("%.2f", rate_ratio_lwr), ',',
                  sprintf("%.2f", rate_ratio_upr), ')'),
@@ -463,7 +482,7 @@ server <- function(input, output) {
   # Graph output
   output$gplot = renderVisNetwork({
     visIgraph(g()$graph, idToLabel = input$node_id_to_label) %>%
-      { 
+      {
         if (is.null(nodes_coordinates[[g()$fid]])) {
           visIgraphLayout(., layout = 'layout_with_sugiyama',
                           layers = g()$levels)
